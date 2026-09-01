@@ -72,6 +72,13 @@ public:
   void compute(T *vReal, T *vImag, uint_fast16_t samples, uint_fast8_t power,
                FFTDirection dir) const;
 
+#if defined(__LGT8FX8P__) || defined(__LGT8FX8E__)
+  // uDSC-accelerated Q15 fixed-point FFT (LGT8F328P only — uDSC path),
+  // scalar Q15 on LGT8F328D/E.  vReal/vImag must contain Q15 samples.
+  void computeLGT(T *vReal, T *vImag, uint_fast16_t samples,
+                  uint_fast8_t power, FFTDirection dir) const;
+#endif
+
   void dcRemoval(void) const;
   void dcRemoval(T *vData, uint_fast16_t samples) const;
 
