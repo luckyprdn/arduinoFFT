@@ -21,6 +21,20 @@
 
 #include "arduinoFFT.h"
 
+// LGT8F328P uDSC accelerator support (Q15 fixed-point FFT)
+// The uDSC coprocessor executes a 16x16 multiply-add/subtract in a single
+// cycle via its MAC engine.  The FFT butterfly is exactly a complex MAC:
+//   t1 = u1*vReal[i1] - u2*vImag[i1]
+//   t2 = u1*vImag[i1] + u2*vReal[i1]
+// We map each butterfly to 4 uDSC half-multiply instructions and read the
+// saturated 16-bit result back from the DSSD register.
+#if defined(__LGT8FX8P__)
+  #include "LGT8Unlocked.h"
+  #define LGT8_FFT_HAS_UDSC 1
+#else
+  #define LGT8_FFT_HAS_UDSC 0
+#endif
+
 template <typename T> ArduinoFFT<T>::ArduinoFFT() {}
 
 template <typename T>
@@ -147,6 +161,78 @@ void ArduinoFFT<T>::compute(T *vReal, T *vImag, uint_fast16_t samples,
     }
   }
 }
+
+#if defined(__LGT8FX8P__) || defined(__LGT8FX8E__)
+template <typename T>
+void ArduinoFFT<T>::computeLGT(T *vReal, T *vImag, uint_fast16_t samples,
+                               uint_fast8_t power, FFTDirection dir) const {
+  // Q15 fixed-point FFT — uDSC-accelerated on LGT8F328P, scalar on 328D/E.
+  // vReal/vImag must be Q15 (value * 32768, 16-bit signed).
+  if (samples < 2 || power == 0) return;
+
+  // -- bit reversal (same as compute()) --
+  uint_fast16_t j = 0;
+  for (uint_fast16_t i = 0; i < (samples - 1); i++) {
+    if (i < j) {
+      swap(&vReal[i], &vReal[j]);
+      swap(&vImag[i], &vImag[j]);
+    }
+    uint_fast16_t k = (samples >> 1);
+    while (k <= j) { j -= k; k >>= 1; }
+    j += k;
+  }
+
+  // -- Q15 FFT stages --
+  float c1f = -1.0f, c2f = 0.0f;
+  uint_fast16_t l2 = 1;
+  for (uint_fast8_t l = 0; l < power; l++) {
+    uint_fast16_t l1 = l2;
+    l2 <<= 1;
+    float u1f = 1.0f, u2f = 0.0f;
+    int16_t u1 = 32767, u2 = 0;  // Q15 of 1.0, 0.0
+
+    for (j = 0; j < l1; j++) {
+      for (uint_fast16_t i = j; i < samples; i += l2) {
+        uint_fast16_t i1 = i + l1;
+        int16_t t1, t2;
+
+#if LGT8_FFT_HAS_UDSC
+        // uDSC half-MAC butterfly: t1 = u1*vR - u2*vI, t2 = u1*vI + u2*vR
+        int16_t vr = (int16_t)vReal[i1];
+        int16_t vi = (int16_t)vImag[i1];
+        lgt::dsp::clear();
+        lgt::dsp::macHalf((uint16_t)u1, (uint16_t)vr, true, true);
+        lgt::dsp::mscHalf((uint16_t)u2, (uint16_t)vi, true, true);
+        t1 = (int16_t)lgt::dsp::saturated();
+        lgt::dsp::clear();
+        lgt::dsp::macHalf((uint16_t)u1, (uint16_t)vi, true, true);
+        lgt::dsp::macHalf((uint16_t)u2, (uint16_t)vr, true, true);
+        t2 = (int16_t)lgt::dsp::saturated();
+#else
+        // scalar Q15 kernel (fallback for non-LGT)
+        t1 = (int16_t)(((int32_t)u1 * (int16_t)vReal[i1] - (int32_t)u2 * (int16_t)vImag[i1]) >> 15);
+        t2 = (int16_t)(((int32_t)u1 * (int16_t)vImag[i1] + (int32_t)u2 * (int16_t)vReal[i1]) >> 15);
+#endif
+        vReal[i1] = vReal[i] - t1;
+        vImag[i1] = vImag[i] - t2;
+        vReal[i] += t1;
+        vImag[i] += t2;
+      }
+      // rotate twiddle factor: u = u * c  (complex multiply in Q15)
+      float zf = u1f * c1f - u2f * c2f;
+      u2f = u1f * c2f + u2f * c1f;
+      u1f = zf;
+      u1 = (int16_t)(u1f * 32768.0f);
+      u2 = (int16_t)(u2f * 32768.0f);
+    }
+    // update stage constants c1, c2 = sqrt((1 ± c)/2)
+    float cTemp = 0.5f * c1f;
+    c2f = sqrtf(0.5f - cTemp);
+    c1f = sqrtf(0.5f + cTemp);
+    if (dir == FFTDirection::Forward) c2f = -c2f;
+  }
+}
+#endif
 
 template <typename T> void ArduinoFFT<T>::dcRemoval(void) const {
   dcRemoval(this->_vReal, this->_samples);
@@ -526,3 +612,4 @@ const T ArduinoFFT<T>::_WindowCompensationFactors[11] = {
 
 template class ArduinoFFT<double>;
 template class ArduinoFFT<float>;
+template class ArduinoFFT<int16_t>;  // Q15 fixed-point (LGT8F328P uDSC)
